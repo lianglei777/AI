@@ -143,9 +143,70 @@ private async execute(input, init): Promise<Response> {
 ```
 ---
 
-## 四、关键实现细节
+## 三、关键实现细节
 
-### 4.1 进程级单例保护
+### 3.0 Public API 总览
+
+`FetchChain` 对外暴露的公共 API 共五个，各司其职：
+
+```typescript
+class FetchChain {
+  // 注册中间件（按 id 去重，按 priority 升序排列）
+  register(middleware: FetchMiddleware): void
+
+  // 安装：替换 globalThis.fetch 为拦截器，含进程级单例保护
+  install(): void
+
+  // 获取原始 fetch 引用（绕过拦截链，供中间件自身发请求使用）
+  getOriginalFetch(): typeof fetch
+
+  // 订阅任意中间件 onResponse 执行完毕的事件，返回取消订阅函数
+  onMiddlewareExecuted(observer: (ev: MiddlewareExecutedEvent) => void): () => void
+
+  // 获取已注册的中间件列表（只读，用于调试/测试）
+  getMiddlewares(): readonly FetchMiddleware[]
+}
+```
+
+**各方法简介**
+
+| 方法 | 核心行为 | 典型调用方 |
+| --- | --- | --- |
+| `register` | 按 `id` 去重，按 `priority` 升序插入；`install()` 前后均可调用 | `QClawContext.registerFetchMiddleware` |
+| `install` | 保存 `originalFetch`，将 `globalThis.fetch` 替换为拦截闭包；进程内多次调用自动 merge | `qclaw-plugin/index.ts` 入口 |
+| `getOriginalFetch` | 返回 `install()` 之前保存的原始 `fetch`；未安装时返回当前 `globalThis.fetch` | 中间件内部发辅助 HTTP 请求 |
+| `onMiddlewareExecuted` | 观察者模式，无侵入地监听整条链的执行情况；返回值调用可取消订阅 | `prompt-inspector` 构建审计日志 |
+| `getMiddlewares` | 返回只读快照，不暴露内部数组引用 | 测试断言、调试打印 |
+
+**`register` 简化实现**
+
+```typescript
+register(middleware: FetchMiddleware): void {
+  const idx = this.middlewares.findIndex(m => m.id === middleware.id);
+  if (idx !== -1) {
+    this.middlewares[idx] = middleware;   // 相同 id 覆盖替换
+  } else {
+    this.middlewares.push(middleware);
+  }
+  this.middlewares.sort((a, b) => a.priority - b.priority);
+}
+```
+
+**`onMiddlewareExecuted` 简化实现**
+
+```typescript
+onMiddlewareExecuted(observer: (ev: MiddlewareExecutedEvent) => void): () => void {
+  this.middlewareExecutedObservers.push(observer);
+  return () => {
+    const idx = this.middlewareExecutedObservers.indexOf(observer);
+    if (idx !== -1) this.middlewareExecutedObservers.splice(idx, 1);
+  };
+}
+```
+
+> 此外还有两个**仅供测试**的方法：`uninstall()`（恢复 `globalThis.fetch`）和静态方法 `FetchChain._resetGlobalInstance()`（清除单例状态）。生产代码不应调用。
+
+### 3.1 进程级单例保护
 
 **问题**：OpenClaw 会为不同运行上下文（多 agent + gateway）多次调用插件 `register()`，每次都创建新的 `FetchChain` 实例，导致 `globalThis.fetch` 被多层嵌套替换。
 
@@ -185,13 +246,13 @@ install(): void {
 }
 ```
 
-### 4.2 延迟注册（Late Registration）
+### 3.2 延迟注册（Late Registration）
 
 **问题**：部分 package 的 `setup()` 是异步的，在 `fetchChain.install()` 之后才完成中间件注册。
 
 **解法**：`execute()` 每次调用时动态读取 `this.middlewares`，而非在 install 时快照。`globalThis.fetch` 指向的闭包始终调用 `this.execute()`，新注册的中间件自动生效。
 
-### 4.3 短路响应（Short-Circuit）
+### 3.3 短路响应（Short-Circuit）
 
 中间件在 `onRequest` 阶段设置 `ctx.shortCircuitResponse`，FetchChain 将**跳过 `originalFetch`**，直接进入 `onResponse` 阶段。
 
@@ -212,7 +273,7 @@ flowchart TB
 
 短路后仍然走完整的 `onResponse` 链——保证 `prompt-inspector` 等中间件能捕获每个响应做审计，不管它是真实的还是伪造的。
 
-### 4.4 getOriginalFetch：逃生通道
+### 3.4 getOriginalFetch：逃生通道
 
 中间件自身需要发 HTTP 请求（拉配置、调审核接口）时，不能被自己拦截。`getOriginalFetch()` 返回 `install()` 前保存的原始 `fetch` 引用：
 
@@ -224,7 +285,7 @@ await fetchRemoteErrorMessages(originalFetch, ctx.logger, ctx.reporter);
 
 同样的模式在 `pcmgr-ai-security`（调用审核接口）和 `queue-guard`（轮询排队接口）中也被使用。
 
-### 4.5 弹性错误隔离
+### 3.5 弹性错误隔离
 
 每个阶段独立 try/catch，单个中间件异常不击穿整条链路：
 
@@ -238,9 +299,9 @@ await fetchRemoteErrorMessages(originalFetch, ctx.logger, ctx.reporter);
 
 ---
 
-## 五、Package 实战解析
+## 四、Package 实战解析
 
-### 5.1 error-response-handler（priority=50）
+### 4.1 error-response-handler（priority=50）
 
 **角色**：最外层兜底。priority 最小 → `onResponse` 最后执行，作为整条链的兜底错误处理。
 
@@ -267,7 +328,7 @@ const middleware: FetchMiddleware = {
 - SSE 伪响应要匹配 `pi-ai` SDK 的解析格式（Anthropic 走 `message_start → content_block_delta → message_stop`，OpenAI 走 `chat.completion.chunk`），否则 SDK 会抛 "request ended without sending any chunks"
 - 用 `response.clone().text()` 读取 body，不消耗原始 Response 流
 
-### 5.2 queue-guard（priority=300）
+### 4.2 queue-guard（priority=300）
 
 **角色**：在 `onRequest` 阶段阻塞 LLM 请求，等后端排队通过后才放行。
 
@@ -317,7 +378,7 @@ sequenceDiagram
 
 
 
-### 5.3 prompt-inspector（priority=950）
+### 4.3 prompt-inspector（priority=950）
 
 **角色**：开发调试工具。priority 最高 → `onResponse` **最先执行**，捕获未经其他中间件修改的原始 LLM 响应。
 
