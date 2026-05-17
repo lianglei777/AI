@@ -1,0 +1,10 @@
+{
+"id": "qclaw-plugin",
+  "name": "QClaw 主插件",
+  "description": "QClaw 自研功能统一入口。将多个功能模块（安全审核、遥测、Prompt 优化、工具沙箱等）整合为 package，通过统一的 Hook 代理和 Fetch 中间件链协调执行。",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
