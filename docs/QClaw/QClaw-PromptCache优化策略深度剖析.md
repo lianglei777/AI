@@ -1,47 +1,28 @@
-# QClaw Prompt Cache 优化策略深度剖析
+# QClaw Prompt Cache 优化策略
 
-> 读完本文你会知道：在多轮 Agent 场景下，为什么仅有的几行机器路径、几次模块顺序抖动，就能让百分位级别的成本翻倍；以及在不动模型、不改服务商的前提下，应用层能做哪些事把 KV cache 命中率拉回来。
 
-关联阅读：[Prompt 管线总览](./QClaw-Prompt处理管线：从用户输入到LLM的完整旅程.md)、[审核链路分层纵深防御](./QClaw-审核链路分层纵深防御深度剖析.md)。
+## 1. Prompt Cache 
 
----
+### 1.1 Prompt Cache 是什么，为什么重要
 
-## 1. 从一个 Bug 看清问题
+大模型解码（分词）时，已经处理过的 token 会被服务端以 KV Cache形式存下来。下次请求若 prompt 的开头若干 token 完全一致，这段前缀就不必再处理了，大模型会直接复用，**复用的这部分的 token 就不会被算入计费了**， 按 Anthropic 的统计， 如果命中 cache 那token 的消耗价格就只有之前的 1/10。
 
-### 1.1 Prompt Cache 是什么，为什么它「脆」
-
-大模型解码时，已经处理过的 token 会被服务端以 KV 形式存下来。下次请求若 prompt 的开头若干 token 完全一致，这段前缀就不必再过一遍 Attention，按 cache read 计费——Anthropic 当前的官方价位大约是普通输入价的 1/10。
-
-这种缓存的关键特性，是它只看「从开头起多长的前缀逐字节相同」。一旦某个位置出现哪怕一个字符差异，从该位置往后的整段前缀都失效。换句话说，**位置敏感、内容敏感、空格敏感**——非常脆。
-
-### 1.2 Agent 场景：缓存为什么经常没命中
-
-把这个特性放进真实 Agent 场景，你会看到几种典型的「自损」：
-
-| 现象 | 触发原因 |
-|------|---------|
-| 换台电脑就全部 miss | system prompt 里嵌着 `/Users/alice/...`、`C:\Users\bob\...` 这类机器相关串 |
-| 跨小版本部分 miss | 多个插件往 system 追加自己的小节，拼接顺序不稳定 |
-| 同一会话每轮都 miss | 当前时间、Runtime、入站上下文塞在 system 顶部，每轮都变 |
-
-QClaw 的应对策略，落在三件事上：**把内容按小节重排到稳定顺序**、**把机器相关串替换成占位符**、**把易变内容从 system 前缀挪到 user/assistant 消息对里**。
-
-下面我们顺着这三件事拆开看。
+所以 Prompt Cache 对模型对用户都很重要。 但是缓存的命中又有个特点，它只看「从开头起多长的前缀逐字节相同」，一旦某个位置出现哪怕一个字符差异，从该位置往后的整段前缀都失效。所以如何做 Prompt 对一个工具来说是非常值得探究的事情。
 
 ---
 
-## 2. 优化器在管线里的位置
+## 2. Prompt Optimize 在 QClaw pipeline 中里的位置
 
-### 2.1 为什么 priority=900：安全先于优化
+### 2.1 为什么安全处理先于Prompt优化
 
-QClaw 的 Fetch 中间件用洋葱模型组织：`onRequest` 按 priority 升序进入，`onResponse` 按降序出栈。安全审核（content-plugin 在 200、pcmgr-ai-security 在 250）放外层，优化器放在 900——接近出口。
+QClaw 的 Fetch 中间件用洋葱模型组织：`onRequest` 按 priority 升序进入，`onResponse` 按降序出栈。安全审核（content-plugin、pcmgr-ai-security）放外层，在输入阶段，安全处理要先与 Prompt优化。
 
-这个排序不是随手设置的。它解决两个潜在冲突：
+这个排序不是随手设置的。它解决两个潜在问题：
 
-- 如果优化器先跑，会改写 prompt 的物理形态（路径变占位符、小节顺序重排），后面的安全审核拿到的就不是用户原始意图，可能造成误判或漏判。
-- 安全审核可能 short-circuit 整个请求（详见审核篇）。优化器跑在 short-circuit 之后没有意义，跑在之前是浪费。
+- 如果Prompt-Optimizer 先执行，会改写 prompt 的物理形态（路径变占位符、小节顺序重排），后面的安全审核拿到的就不是用户原始意图，可能造成误判或漏判。
+- 如果安全审核有问题，那所有的处理都没有意义，整个请求就会被拒绝。
 
-因此：让安全决策先做出，再让最贴近网络出口的中间件把请求 body 改成「LLM 友好」的形态。
+所以必须先做安全审核。
 
 ### 2.2 主流程的形状
 
@@ -68,34 +49,17 @@ flowchart TD
     Read --> Extract --> UserFill --> Custom --> Override --> Path --> Rebuild --> Inject --> Finalize --> Report
 ```
 
-一个关键设计是：`loadConfig` 必须使用 `ctx.getOriginalFetch()` 而不是当前的 `fetch`。原因是当前的 `fetch` 已经被 FetchChain 包裹，再去拉远端配置会触发递归。这是个不显眼但很重要的反例：在中间件里发起网络请求，永远要拿原始 fetch。
-
-### 2.3 协议分叉
-
-Anthropic 和 OpenAI 在 system prompt 的承载方式上不同：
-
-- Anthropic 把 system 放在请求体顶层（可以是字符串或 text block 数组），messages 里不应该出现 `role=system`。
-- OpenAI 把 system 当作 messages 数组里的第一条消息。
-
-优化器用一个简单判定收敛差异：URL 含 `anthropic`，**或者**请求体有顶层 `system` 且 messages 里没有 `role=system`。后一条判定是为了识别那种走 OpenAI 兼容协议、但实际上是 Anthropic 形态的请求。读写时分两支处理，处理完后再统一收尾保证 Anthropic 协议合规。
-
-源码锚点：`packages/prompt-optimizer/index.ts` 的 `processRequestBody`、`registerFetchMiddleware`。
-
 ---
 
-## 3. 手法一：把内容按小节稳定下来
+## 3. 优化方式一： 把 Prompt 内容中的 section 部分的顺序稳定下来
 
-### 3.1 用什么作分隔符：成本与可读性的折衷
+### 3.1 如何找出section 部分
 
-要做小节重排，第一步要切分。可选方案大致有三类：
+要做 section 重排，第一步要把 section 部分找出来。 OpenClaw 是以 Markdown 的形式来写 Prompt的， 所以通过 二级标题 `## ` 去分离 section 是一种不错的方式
 
-1. 在 system prompt 里嵌入框架自定义的 marker，比如 `<<<SECTION:foo>>>`——可靠，但污染模型可见上下文，也让 prompt 不便于人工阅读。
-2. 完全靠 NLP/规则识别小节——脆弱，且需要框架先训练。
-3. 借用 Markdown 已有的二级标题 `## `——零侵入，但需要规避用户内容里出现 `##` 的「假阳性」。
+QClaw 就是使用这种方式，再加上 白名单 兜底逻辑。代码逻辑非常朴素：扫每一行，行首是 `## ` 时把后面内容当成section标题；如果当前配置里给了白名单，那么只有白名单内的标题才被认作新小节开头，其余 `## ` 行被当作普通文本归到上一节里。
 
-QClaw 选了 3，再用白名单兜底。代码逻辑非常朴素：扫每一行，行首是 `## ` 时把后面当成小节标题；如果当前配置里给了白名单，那么只有白名单内的标题才被认作新小节开头，其余 `## ` 行被当作普通文本归到上一节里。
-
-这是一个典型的「自由格式 + 配置约束」组合：默认行为足以应付大部分 prompt，遇到特殊文档习惯也能通过控制面收敛。
+这是一个典型的「自由格式 + 配置约束」组合：默认行为足以应付大部分 prompt 场景，遇到特殊文档习惯也能通过白名单收敛。
 
 ```mermaid
 flowchart LR
@@ -106,7 +70,7 @@ flowchart LR
     Pre[第一个允许标题前的内容] --> Drop[丢弃 preamble]
 ```
 
-### 3.2 路径标题的双向 basename 别名
+### 3.2 特殊的 section 标题处理
 
 有一种小节标题本身就是路径，比如 `## /Users/alice/.qclaw/workspace/HEARTBEAT.md`。如果配置文件里硬写完整路径，换台机器就失效。
 
@@ -153,88 +117,26 @@ flowchart LR
     Map --> Chain[custom → overrides] --> Final[按 ordered 拼接]
 ```
 
-源码锚点：`processRequestBody` 里 `if (hasUserConfig) { const missingSections = ... }` 的回扫块。
 
 ---
 
-## 4. 手法二：把机器相关串变成占位符
+## 4. 优化方式二：把机器相关的文件路替换为占位符处理
 
-### 4.1 为什么不能只在编译期写死
-
-Skill 目录、扩展目录、工作区根目录这些路径，会因为：
+Skill 目录、extensions 目录、workspace 目录这些路径，会因为以下原因导致差异：
 
 - 安装位置（`/Applications` vs 自定义目录）
 - 操作系统（Unix 风 `/` vs Windows 风 `\`）
 - 用户名（每个用户都不一样）
 - workspace 实例（多开时形如 `workspace-agent-5cb34fee`）
 
-而在每台机器上呈现完全不同的字面值。这就是经典的「环境绑定串」问题——同样的语义，前缀字节不同。
+**所以同一个对话窗口，在不同的机器上，因为路径问题，就有可能导致server端的 Prompt Cache 失效。**
 
-通用解法是引入占位符：把 `/Users/alice/.qclaw/workspace/skills` 这样的串替换成 `{workspace_skill_dir}`，模型看到占位符时去附带的映射表里查真值再访问磁盘。
+Qclaw 的解法是引入占位符：把 `/Users/alice/.qclaw/workspace/skills` 这样的路径字符串替换成 `{workspace_skill_dir}`，这样 模型看到的内容是一样的， 如果需要路径，就去附带的映射表里查真值再访问磁盘。这样就避免了因为路径问题导致缓存失效的问题
 
-### 4.2 路径检测：先抓所有可能，再用 tail 收敛
-
-实现里把检测和归类分开做。检测阶段用三组正则覆盖三类形态：
-
-| 形态 | 例子 | 备注 |
-|------|------|------|
-| Unix 绝对路径 | `/Applications/QClaw/skills` | 至少两段，避免误抓 `/usr` 之类太短的 |
-| `~/...` | `~/.qclaw/workspace/skills` | 兼容 Windows 反斜杠形式 |
-| Windows 绝对 | `C:\Users\bob\.qclaw` | 大小写盘符均可 |
-
-有一个细节值得注意：Unix 正则会跟 `~/` 正则在 `~/.qclaw` 这种串上「打架」——如果不处理，Unix 正则会从 `~` 后的 `/` 开始抓出一段 `/.qclaw/...`，造成同一个路径被同时收到两种形态里。处理办法是在 Unix 正则循环里检查匹配位置前一个字符是不是 `~`，是就跳过。
-
-```js
-if (m.index > 0 && text[m.index - 1] === '~') continue
-```
-
-很小的一行，但它体现了「使用宽松正则 + 上下文兜底」这种工程做法的典型场景。
-
-### 4.3 归类：tail 命中 + 优先级 + 变体
-
-抓到的原始路径只是字符串，要变成有意义的占位符还得归类。归类规则用一张表表达：
-
-```js
-{ tail: '/.qclaw/workspace/skills', placeholder: '{qclaw_skill_dir}', priority: 11 }
-```
-
-`tail` 是「在归一化路径上要查找的尾段」。匹配方式有两种：
-
-- 精确匹配：tail 后面紧跟 `/` 或字符串结束。比如 `/Users/alice/.qclaw/workspace/skills` 精准对上 `{qclaw_skill_dir}`。
-- 扩展变体：tail 后面紧跟非 `/` 字符，比如 `/Users/alice/.qclaw/workspace-agent-5cb34fee/skills` 中 tail 是 `/workspace/skills`，但实际是 `workspace-agent-xxx`。此时把 `agent-5cb34fee` 提出来作为标签，生成 `{workspace_root_dir:agent-5cb34fee}` 这种带后缀的占位符。
-
-优先级（priority）的作用是消歧。同一条原始路径可能同时匹配多个 tail（比如 `/.openclaw/workspace/skills` 和 `/.qclaw/workspace/skills` 都含 `/skills`）。模式按 priority 降序排，原始路径按长度降序排，让最具体的语义先消耗最长的字符串。这是「贪婪匹配 + 优先消费」的经典策略。
-
-### 4.4 替换与映射段：避免自引用
-
-替换阶段对每个绝对路径做两件事：
-
-```js
-result = result.split(absolutePath).join(placeholder)
-// 还要兼容反斜杠版本
-result = result.split(flipped).join(placeholder)
-```
-
-为了让模型知道这些占位符指什么，优化器还会构造一个 `## Path Variable Mappings` 小节，把映射关系连同一句自然语言指令一起喂进去——告诉模型「遇到占位符请先查表替换成真实路径再去访问磁盘」。
-
-这里有一个反直觉的细节：**映射段本身不能参与替换**。否则会变成 `{workspace_skill_dir} = {workspace_skill_dir}`，模型彻底失去线索。所以注入用户消息的时候，要先把内容按 `## Path Variable Mappings` 分成前后两半，只对前半做替换，后半原样保留。
-
-```mermaid
-flowchart TD
-    Body[注入到 user 的内容] --> Split{包含_Path_Variable_Mappings}
-    Split -->|否| ReplaceAll[整段替换]
-    Split -->|是| Cut[截成 before_+_mapping]
-    Cut --> ReplaceBefore[仅替换 before]
-    Cut --> KeepMapping[mapping 段原样保留]
-    ReplaceBefore --> Merge[合回]
-    KeepMapping --> Merge
-```
-
-源码锚点：`detectPathReplacements`、`applyPathReplacements`、`buildPathMappingSection`。统计实际替换次数的 `countReplacementsInText` 是为 telemetry 服务的，不影响替换正确性。
 
 ---
 
-## 5. 手法三：把易变内容挪出 system 前缀
+## 5. 优化方式三：把易变的内容挪出 system prompt
 
 ### 5.1 为什么不能拼到最后一条 user 消息
 
@@ -291,20 +193,6 @@ flowchart TD
 
 ---
 
-## 6. Anthropic 协议的「保留字段」处理
-
-Anthropic 协议比较特别：`system` 字段允许是字符串，也允许是 text block 数组，且 block 上可以挂 `cache_control` 这类 metadata。
-
-这意味着优化器写回 system 时必须考虑两件事：
-
-1. 如果原始 system 是数组（说明上游在 block 上挂了 cache_control），写回时必须保留数组形态、保留第一个 text block 的 metadata，只替换 text 字段。否则会丢失服务商侧的显式 cache 标记。
-2. 如果 messages 里混入了 `role=system`（不规范但偶有发生），最终阶段要扫一遍把它们合并到顶层 system 字段，再从 messages 里 filter 掉。这样既保证协议合规，也避免数据丢失。
-
-代码里这两段非常短，但它体现了「保留上游已经做对的事」这种克制：优化器不假定自己是唯一关心 cache 的人。
-
-源码锚点：`processRequestBody` 中 `originalSystemIsArray` 处理分支、文件末尾「Anthropic 协议最终保障」块。
-
----
 
 ## 7. 配置加载：把抖动控制在「永远不阻塞用户」
 
