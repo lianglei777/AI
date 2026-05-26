@@ -29,14 +29,14 @@ qclaw-plugin/
 │   ├── http-route-registry.ts
 │   └── command-registry.ts
 │
-└── packages/                   ← 功能模块层（16 个 Package + 1 个公共库）
+└── packages/                   ← 功能模块层（15 个活跃 Package + 1 个公共库；tool-sandbox 已下线）
     ├── shared/                 ← 公共工具库（非 Package）
     ├── trace-span-reporter/
     ├── error-response-handler/
     ├── content-plugin/
     ├── pcmgr-ai-security/
     ├── skill-interceptor/
-    ├── tool-sandbox/
+    ├── tool-sandbox/             ← 已下线，不在 index.ts PACKAGES 中
     ├── queue-guard/
     ├── qmemory/
     ├── auto-memory/
@@ -90,7 +90,7 @@ qclaw-plugin/
 | Package | 定位 |
 |---------|------|
 | `qmemory` | WAL 检查点记录任务进度，进程崩溃后透明恢复 |
-| `auto-memory` | 自动将对话要点沉淀为长期记忆文件并注入下次对话；DESIGN.md 记录了 djb2 锚点的设计原因 |
+| `auto-memory` | 在 `agent_end` 异步提取对话要点写入 daily/MEMORY.md；下轮对话由模型通过 `read_file` 读取（非 prompt 注入）；DESIGN.md 记录了 djb2 锚点设计 |
 
 **安全与合规**
 
@@ -99,7 +99,7 @@ qclaw-plugin/
 | `content-plugin` | 覆盖 Agent 9 个生命周期事件的内容安全审核与遥测上报 |
 | `pcmgr-ai-security` | 对接 LLMShieldClient 做 AI 行为审计，带熔断器（Fail-Open） |
 | `skill-interceptor` | 拦截 Skill 调用三种入口，对接四种授权后端；逻辑按职责拆分到多文件 |
-| `tool-sandbox` | Windows 专属，PowerShell wrapper 降权执行 exec 工具 |
+| `tool-sandbox` | （已下线）Windows 专属 PowerShell wrapper 降权 exec；源码仍保留于 packages/，未加入 PACKAGES |
 
 **性能与资源治理**
 
@@ -156,7 +156,7 @@ flowchart TB
     end
 
     subgraph L3 ["Layer 3：Package 层"]
-        PKG["16 个功能 Package\n每个通过 setup(ctx) 接入框架"]
+        PKG["15 个活跃 Package\n每个通过 setup(ctx) 接入框架"]
     end
 
     HP -->|"api.on() 单次注册"| OC_API
@@ -175,7 +175,7 @@ flowchart TB
 
 **HookProxy**：Hook（事件钩子）调度中心。对每个 OpenClaw 事件名只调用一次 `api.on()`，内部维护一张按 `priority` 排序的 handler 列表。每次事件触发时，由 `dispatch()` 按序执行，支持 block 语义（违规时阻断后续 handler）、params 改写语义（将修改后的参数传递给下游）和 Observer 模式（无侵入观察所有 handler 的执行结果）。
 
-**FetchChain**：`globalThis.fetch` 的统一拦截层。采用洋葱模型——请求按 priority 升序流过各中间件的 `onRequest`，到达真实网络后，响应按逆序流过各中间件的 `onResponse`。进程级单例保护确保 OpenClaw 多次调用 `register()` 时不会重复包裹 fetch。
+**FetchChain**：`globalThis.fetch` 的统一拦截层。采用洋葱模型——请求按 priority 升序流过各中间件的 `onRequest`，到达真实网络后，响应按逆序流过各中间件的 `onResponse`。进程级单例保护确保 OpenClaw 多次调用 `register()` 时不会重复包裹 fetch。执行细节与扩展指南见 [03-qclaw-fetch-chain-deep-dive.md](./03-qclaw-fetch-chain-deep-dive.md)。
 
 **ConfigCenter**：配置热更新中心。合并两层来源（文件配置 + 静态配置），通过 `fs.watch` + 10s TTL 双保障感知变更，按 packageId 做 diff 后精准通知受影响的 Package。
 
@@ -190,7 +190,7 @@ sequenceDiagram
     participant User as 用户
     participant OC as OpenClaw
     participant HP as HookProxy
-    participant CP as "content-plugin(200)"
+    participant CP as "content-plugin(300)"
     participant QG as "queue-guard(300)"
     participant FC as FetchChain
     participant LLM as LLM服务
@@ -198,16 +198,16 @@ sequenceDiagram
 
     User->>OC: 发送消息
     OC->>HP: 触发 message_received
-    HP->>CP: dispatch (priority=200)
+    HP->>CP: dispatch (priority=300)
     CP-->>HP: ok，内容合规
     HP-->>OC: 事件处理完毕
 
     Note over OC,HP: OpenClaw 组装 System Prompt，准备调用 LLM
     OC->>HP: 触发 llm_input
-    HP->>CP: dispatch (priority=200)
+    HP->>CP: dispatch (priority=300)
     CP-->>HP: ok
     HP->>QG: dispatch (priority=300)
-    QG-->>HP: ok，排队通过
+    QG-->>HP: ok，入队上下文
     HP-->>OC: 事件处理完毕
 
     OC->>FC: 调用 globalThis.fetch（LLM 请求）
@@ -215,8 +215,8 @@ sequenceDiagram
     FC->>TSR: onRequest priority=250，注入 x-agent-request-id
     FC->>LLM: originalFetch
     LLM-->>FC: 返回响应流
-    Note over FC: onResponse 阶段（priority 逆序）
-    FC->>TSR: onResponse priority=100
+    Note over FC: onResponse 阶段（priority 逆序；TSR 无 onResponse）
+    FC->>CP: onResponse priority=200，输出审核
     FC-->>OC: 最终响应
 
     OC->>HP: 触发 agent_end
@@ -428,8 +428,9 @@ export interface QClawPackage {
 | 400 | cron-delivery-guard | Hook | Cron 投递参数守卫 |
 | 500 | 默认值 | — | 未指定 priority 时的默认值 |
 | 500 | pcmgr-ai-security | `llm_input` | 未传 priority 参数，走默认 |
+| 900 | prompt-optimizer | FetchMiddleware | 在 onRequest 末段重排 System Prompt |
 | 900 | trace-span-reporter | `agent_end` | 延迟 finalize，等待 `llm_output` 写入 usage |
-| 950 | prompt-inspector | Hook + FetchMiddleware | 调试工具最后执行，看到所有处理后的最终态 |
+| 950 | prompt-inspector | Hook + FetchMiddleware | 调试工具；Fetch onResponse 最先执行以捕获原始响应 |
 
 **核心原则**：观测（100）→ 安全（200/250/280）→ 排队（300）→ 业务（400~500）→ 调试（950）。兜底层（50）在 onResponse 最外。
 
@@ -449,8 +450,8 @@ export interface QClawPackage {
 **qmemory**：*用 WAL 检查点记录任务进度，进程崩溃后自动恢复。*
 在 `before_tool_call` / `after_tool_call` / `agent_end` 三个时机打点，进程崩溃重启后，通过 FetchMiddleware 在 `onRequest` 阶段透明注入恢复上下文到 LLM 请求的 messages 数组中。提供 `/status`、`/dismiss`、`/cleanup` HTTP 接口和 `/resume` 聊天命令。
 
-**auto-memory**：*自动将对话要点沉淀为长期记忆文件，并在下次对话时注入。*
-在 `agent_end` 时异步提取对话要点写入 `memory/YYYY-MM-DD.md`，定时合并为 `MEMORY.md`，在 `before_prompt_build` 时注入。游标使用 djb2 hash 锚点防漂移——纯行号索引会因 messages compact 而偏移。
+**auto-memory**：*自动将对话要点沉淀为长期记忆文件，供下轮对话读取。*
+在 `agent_end` 时异步提取对话要点写入 `memory/YYYY-MM-DD.md`，定时合并为 `MEMORY.md`；下轮 session 中模型通过 `read_file` 读取 MEMORY.md（见 DESIGN.md），**不在 `before_prompt_build` 注入**。游标使用 djb2 hash 锚点防漂移——纯行号索引会因 messages compact 而偏移。
 
 ---
 
@@ -465,8 +466,8 @@ export interface QClawPackage {
 **skill-interceptor**：*拦截 Skill 调用的三种入口，对接四种授权后端验证使用权限。*
 支持 `use_skill` 工具调用 / `read` 读取 / `exec` 执行三种入口，授权结果在 session 维度缓存，PC 端和外部渠道使用不同的阻断 UI 策略。
 
-**tool-sandbox**：*Windows 专属，用 PowerShell wrapper 对 exec 工具进行降权执行。*
-提取命令中的路径并与 protected/credential 目录表对比。`isSkillManagementCommand` 使用行尾 `$` 锚定正则，防止命令注入绕过检测。macOS 上整个 Package 禁用。
+**tool-sandbox**（已下线）：*Windows 专属，用 PowerShell wrapper 对 exec 工具进行降权执行。*
+源码仍保留于 `packages/tool-sandbox/`，但 `index.ts` PACKAGES 注释标明已下线，不再参与运行时调度。
 
 ---
 
