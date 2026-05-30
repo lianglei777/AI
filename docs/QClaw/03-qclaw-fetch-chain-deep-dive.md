@@ -1,8 +1,8 @@
 # FetchChain 深度解析：qclaw-plugin 的 LLM 请求拦截链
 
 > OpenClaw 访问大模型只有一条路：`globalThis.fetch`。qclaw-plugin 用 **FetchChain** 把十几种「改请求、拦响应、假回复」的能力收进**一条**可预测的中间件链——本文专门讲这条链为什么存在、怎么跑、设计上有哪些取舍。  
-> 想查模块地图请看 [01-qclaw-plugin-architecture-research.md](./01-qclaw-plugin-architecture-research.md)；想跟一条消息的时间线请看 [02-qclaw-plugin-data-journey.md](./02-qclaw-plugin-data-journey.md)。  
-> 源码路径（未压缩版本）：`resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts`。
+> 想查模块地图请看 [01](./01-qclaw-plugin-architecture-research.md)；想跟一条消息的时间线请看 [02](./02-qclaw-plugin-data-journey.md)。  
+> **本文目标：不读源码也能理解 FetchChain 的原理与扩展方式。**
 
 ---
 
@@ -63,20 +63,9 @@ flowchart TB
 | 重复包裹 | OpenClaw 为多 Agent / Gateway **多次**调用 `register()`，N 次 install → 同一请求被中间件处理 N 遍 | 进程级单例，后续实例**合并中间件**，不再替换 `globalThis.fetch` |
 | 自拦截 | 中间件内部再 `fetch` 拉配置/上报，会被自己的链拦住甚至递归 | `ctx.getOriginalFetch()` 绕过链 |
 
-多次 `register()` 的根因在源码文件头写得很直白：
+FetchChain 的设计注释概括了洋葱顺序：**onRequest 按 priority 升序**，到达真实网络后 **onResponse 按 priority 降序**（兜底层 error-response-handler 的 50 在 onResponse 最外）。
 
-```1:8:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-/**
- * core/fetch-chain.ts — Fetch 中间件链
- *
- * 单点安装 globalThis.fetch，多 package 注册中间件。
- * 执行顺序（洋葱模型）：
- *   request:  priority 100 → 150 → 200 → 250 → originalFetch
- *   response: priority 250 → 200 → 150 → 100
- */
-```
-
-OpenClaw 会为不同运行上下文（多 agent + gateway）多次调用插件的 `register()`，每次都会 `new FetchChain()`。若不做单例保护，每次 install 都在已有拦截器外再套一层，用户发一条消息，审核、排队、优化会各跑 N 遍。
+OpenClaw 会为不同运行上下文（多 agent + gateway）多次调用插件的 `register()`，每次都会新建 FetchChain 实例。若不做单例保护，每次 install 都在已有拦截器外再套一层，用户发一条消息，审核、排队、优化会各跑 N 遍。
 
 ### 1.3 与 HookProxy 的对称设计
 
@@ -85,13 +74,13 @@ FetchChain 不是孤立发明，而是与 **HookProxy** 成对出现的基础设
 - **HookProxy**：对每个 OpenClaw 事件名只调用一次 `api.on()`，内部按 `priority` 调度各 Package 的 handler，统一管理 `block` 语义。
 - **FetchChain**：对 `globalThis.fetch` 只替换一次，内部按 `priority` 做洋葱调度，统一管理 `shortCircuitResponse`。
 
-两条管道共享同一套 **priority 产品语义**：观测(100) → 安全(200/250) → 排队(300) → 业务(900) → 调试(950)；兜底层 error-response-handler 的 priority 50 在 **onResponse 逆序时最后执行**（最外层包装 HTTP 错误）。
+两条管道共享同一套 **priority 产品语义**：观测(100) → 安全(200/250) → 排队(300) → 业务(900) → 调试(950)；兜底层 error-response-handler 的 priority 50 在 **onResponse 逆序时最后执行**（最外层包装 HTTP 错误）。数字表以 [02 附录](./02-qclaw-plugin-data-journey.md#appendix-dev) 为准。
 
 ---
 
 ## 二、FetchChain 是什么：主要职责
 
-FetchChain 类（`core/fetch-chain.ts`）承担三件事：
+FetchChain 承担三件事：
 
 1. **安装点** — `install()` 保存原始 fetch，用拦截函数替换 `globalThis.fetch`；通过 `Object.assign(interceptor, originalFetch)` 保留 Node.js 22+ 上 fetch 的静态属性（如 `preconnect`）。
 2. **注册点** — Package 在 `setup(ctx)` 里调用 `ctx.registerFetchMiddleware()`，框架不直接把 OpenClaw API 暴露给 Package。
@@ -99,24 +88,13 @@ FetchChain 类（`core/fetch-chain.ts`）承担三件事：
 
 ### 2.1 生命周期：从 register 到 install
 
-插件入口 `index.ts` 在每次 OpenClaw 调用 `register(api)` 时：
+插件入口在每次 OpenClaw 调用 `register(api)` 时：
 
-1. `new FetchChain()`
+1. 创建 FetchChain 实例
 2. 依次为 15 个 Package 创建 `QClawContext` 并执行 `setup(ctx)`（各 Package 在此注册中间件）
-3. **最后**无条件 `fetchChain.install()`
+3. **最后**无条件 **install()**，替换全局 `fetch`（仅进程内第一次真正替换；后续 register 合并中间件）
 
-```205:206:resources/openclaw/config/extensions/qclaw-plugin/index.ts
-    // 安装 FetchChain（无条件安装，支持 package 延迟注册中间件）
-    fetchChain.install()
-```
-
-Package 侧注册只是薄封装：
-
-```90:92:resources/openclaw/config/extensions/qclaw-plugin/core/context.ts
-    registerFetchMiddleware(middleware: FetchMiddleware): void {
-      fetchChain.register(middleware)
-    },
-```
+Package 通过 `ctx.registerFetchMiddleware(...)` 注册，无需直接操作 `globalThis.fetch`。
 
 ```mermaid
 sequenceDiagram
@@ -142,7 +120,16 @@ sequenceDiagram
 
 ## 三、执行模型：一次 fetch 如何穿过链条
 
-本章是全文技术核心。实现集中在 `FetchChain.execute()`。
+本章是全文技术核心。下列行为由 FetchChain 的 **execute** 流程驱动（匹配中间件 → onRequest → 可选短路 → 真实 fetch → onResponse 逆序）。
+
+**扩展上线前检查清单（实践要点）：**
+
+- 内部 HTTP 是否使用 **`getOriginalFetch()`**？（拉配置、上报、调审核 API）
+- `match` 是否窄化到 LLM 请求，并排除自身服务 URL？
+- onRequest / onResponse 异常是否 **fail-open**（返回原 ctx / response）？
+- 需拦截用户可见回复时，优先 **`shortCircuitResponse`** 而非 throw？
+- priority 是否与 content(200)、queue-guard(300)、optimizer(900) 等协调？对照 [02 附录](./02-qclaw-plugin-data-journey.md#appendix-dev)。
+- 需对照接口字段时，见 [附录 A（可选）](#附录-a可选fetchmiddleware-接口速查)。
 
 ### 3.1 洋葱模型四阶段
 
@@ -208,134 +195,26 @@ return response
 - Hook `{ block: true }`：同一事件后续 handler **不再执行**。
 - Fetch `shortCircuitResponse`：**不发起真实 HTTP**，但仍有 `response` 对象，**继续走 onResponse 逆序**——例如 error-response-handler 仍可在最外层包装错误形态。
 
-### 3.3 execute() 源码导读
+### 3.3 execute 流程三步（实现摘要）
 
-**① 筛选匹配中间件，无匹配则快速放行**
-
-```168:176:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-    const matched = this.middlewares.filter(
-      (m) => !m.match || m.match(input, init),
-    )
-
-    if (matched.length === 0) {
-      // 没有匹配的中间件，直接调用原始 fetch
-      return this.originalFetch!(input, init)
-    }
-```
-
-**② onRequest 正序 + 短路检测**
-
-```185:206:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-    for (const mw of matched) {
-      if (!mw.onRequest) continue
-      // ...
-        ctx = await mw.onRequest(ctx)
-        if (ctx.shortCircuitResponse) {
-          console.log(`${LOG_TAG} [diag] onRequest ${mw.id} SHORT_CIRCUIT url=${urlTag}`)
-        }
-      // catch: 只打日志，不 throw
-    }
-    // ...
-    if (ctx.shortCircuitResponse) {
-      response = ctx.shortCircuitResponse
-    } else {
-      response = await this.originalFetch!(ctx.input, ctx.init)
-```
-
-**③ onResponse 逆序 + observer 通知**
-
-```240:266:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-    for (let i = matched.length - 1; i >= 0; i--) {
-      const mw = matched[i]!
-      if (!mw.onResponse) continue
-      // ...
-        response = await mw.onResponse(responseCtx)
-        const modified = response !== responseBefore
-        // onMiddlewareExecutedObservers 通知 prompt-inspector 等
-```
+1. **匹配**：仅 `match` 为真（或未定义 match）的中间件参与；若无匹配，直接调用原始 fetch。
+2. **onRequest 正序**：依次改写 `input` / `init` / `extra`；某步设置 `shortCircuitResponse` 则**跳过真实 HTTP**，但仍进入 onResponse；单步抛错只记诊断日志，不中断链条。
+3. **onResponse 逆序**：从大到小 priority 处理响应体；可通知 observer（供 prompt-inspector 等）；error-response-handler(50) 在最外包裹 HTTP 错误为 SSE。
 
 ---
 
 ## 四、设计特点：FetchChain 的工程取舍
 
-以下每条结构为：**设计特点 → 代码证据 → 为什么这样**。
-
-### 4.1 进程级单例 + 中间件合并
-
-第二次及以后的 `FetchChain.install()` 发现 `globalInstance` 已存在时，把当前实例的中间件 `register` 到已安装实例，**不再**替换 `globalThis.fetch`：
-
-```71:89:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-    if (FetchChain.globalInstance && FetchChain.globalInstance !== this) {
-      const existing = FetchChain.globalInstance
-      for (const mw of this.middlewares) {
-        existing.register(mw)
-      }
-      this.installed = true
-      this.originalFetch = existing.originalFetch
-      // ... Skipping globalThis.fetch replacement.
-      return
-    }
-```
-
-单元测试 `第二个 FetchChain 实例 install 时应该合并中间件而非重复替换 globalThis.fetch` 锁定了这一行为（`__tests__/fetch-chain.test.ts`）。
-
-### 4.2 模块级共享 middlewares 数组
-
-```13:13:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-const middlewares:FetchMiddleware[] = []
-```
-
-所有 `FetchChain` 实例的 `private middlewares` 都指向同一数组。这是**刻意设计**：合并语义要求「第二次 register 的中间件进入同一份列表」，而不是每个实例各维护一份。
-
-### 4.3 priority 显式调度，与注册顺序无关
-
-每次 `register()` 后按 `priority` 升序排序。执行顺序是架构决策，不应依赖 `PACKAGES` 数组顺序或 `setup` 完成先后。
-
-同 priority 多个中间件（如 250 的 trace-span-reporter 与 pcmgr-ai-security）在排序稳定时以**注册顺序** tie-break；新 Package 应查 [01 §5.3 优先级规范](./01-qclaw-plugin-architecture-research.md)，尽量避免与安全/观测层抢同一数字。
-
-### 4.4 id 去重：同 id 只保留最新
-
-```37:49:resources/openclaw/config/extensions/qclaw-plugin/core/fetch-chain.ts
-  register(middleware: FetchMiddleware): void {
-    const existingIdx = this.middlewares.findIndex((m) => m.id === middleware.id)
-    if (existingIdx !== -1) {
-      this.middlewares[existingIdx] = middleware
-      // replaced existing middleware
-    } else {
-      this.middlewares.push(middleware)
-    }
-    this.middlewares.sort((a, b) => a.priority - b.priority)
-```
-
-支持重复 setup 或热更新场景：同一 Package 再次注册中间件会覆盖旧实例，而不是链上出现两个相同 id。
-
-### 4.5 延迟注册（late registration）
-
-`install()` 之后仍可 `register()`，因为 `execute()` **动态读取** `middlewares` 数组。单测 `install() 后注册的中间件应该自动生效` 覆盖了这一点——便于异步 setup 或未在首轮 register 完成的模块补注册。
-
-### 4.6 错误隔离 + fail-open 文化
-
-中间件 `onRequest` / `onResponse` 抛错不会冒泡到 OpenClaw Agent 循环，只记 `[qclaw-plugin:fetch-chain] [diag] ... ERROR`。这与 qclaw-plugin 整体原则一致（[01 原则四](./01-qclaw-plugin-architecture-research.md)）：**误拦截（false positive）的代价远高于漏拦截**——单个中间件挂了，请求仍应尽量继续。
-
-Package 层普遍在 catch 后 `return ctx` / `return response` 放行；queue-guard 排队接口异常时 **fail-open** 直接放行 LLM 请求。
-
-### 4.7 可观测性与调试钩子
-
-- **`onMiddlewareExecuted(observer)`**：每个 `onResponse` 执行后通知 observer，携带 `middlewareId`、`modified`、`action: 'transform' | 'pass'`；prompt-inspector 据此记录 Response 修改链。
-- **`urlTag()`**：日志只打印 URL path 末两段（如 `v1/messages`），避免完整 URL 泄露。
-- **`getMiddlewares()`**：测试与启动日志列举 `[id(priority), ...]`。
-
-### 4.8 getOriginalFetch：防止递归与自拦截
-
-中间件或 Package 若需再发 HTTP（拉远端配置、调审核 API、遥测上报），必须使用 **`ctx.getOriginalFetch()`**，否则会再次进入 FetchChain，造成递归或「审核请求被审核中间件拦截」。
-
-| 场景 | 使用方 |
-|------|--------|
-| 拉远端配置 / 审核 API | prompt-optimizer、error-response-handler、pcmgr-ai-security |
-| 审计上报 | audit-log-reporter、data-sync-report |
-| 灰度探测 | skill-usage-analyzer |
-
-`getOriginalFetch()` 在 install 前调用时返回当前 `globalThis.fetch`；install 后返回保存的原始引用。
+| 特点 | 行为 | 为什么 |
+|------|------|--------|
+| **进程级单例 + 合并** | 第二次 install 只把中间件并入已安装实例，不再套一层 `globalThis.fetch` | 避免多次 register 导致同一请求跑 N 遍 |
+| **共享中间件列表** | 多实例指向同一份 middlewares 数组 | 合并语义要求「后注册的模块进入同一链条」 |
+| **priority 显式调度** | 与 PACKAGES 初始化顺序无关 | 架构决策应写在数字上，见 [02 附录](./02-qclaw-plugin-data-journey.md#appendix-dev) |
+| **同 id 覆盖** | 重复 register 同 id 中间件时替换旧实例 | 支持热更新、重复 setup |
+| **延迟注册** | install 之后仍可 register，下次 fetch 即生效 | 异步 setup 补注册 |
+| **错误隔离 + fail-open** | 中间件抛错只记诊断日志，不拖垮 Agent；queue-guard 等异常时放行 | 与 [01 初始化不拖垮整插件](./01-qclaw-plugin-architecture-research.md) 同属「可用性优先」；**不等于**放弃内容审核策略（见 [05](./05-qclaw-content-security-compliance.md)） |
+| **getOriginalFetch** | 拉配置、审核、上报等内部 HTTP 必须绕过链条 | 防递归与「审核请求审到自己」；prompt-optimizer、pcmgr、error-response-handler 等 |
+| **可观测** | `onMiddlewareExecuted`、启动日志中的 middleware 列表 | prompt-inspector 等调试链；日志 URL 仅打 path 末段 |
 
 ---
 
@@ -344,6 +223,8 @@ Package 层普遍在 catch 后 `return ctx` / `return response` 放行；queue-g
 [02「等模型回复时」](./02-qclaw-plugin-data-journey.md#等模型回复时请求经过哪些关卡) 从用户视角列过关卡表；本节从 **FetchChain 机制** 对照同一张表，并展开三个典型案例。当前活跃 **7 个 Package** 注册了 FetchMiddleware（error-response-handler 几乎只做 onResponse）。
 
 ### 5.1 总表
+
+与 [02 §出门](./02-qclaw-plugin-data-journey.md#出门请求一层层过) 一致；有变更时**只改 02 附录**。
 
 | priority | Package | onRequest | onResponse |
 |:--------:|---------|-----------|------------|
@@ -360,22 +241,9 @@ onRequest 走 priority 升序；onResponse 走降序，故 950 先于 200，50 �
 
 ### 5.2 案例 A：content-plugin 输入拦截（shortCircuit）
 
-输入审核未通过时，不调用真实 LLM，在 onRequest 里构造 SSE 假响应并写入 `shortCircuitResponse`：
+输入审核未通过时，**不调用真实 LLM**：content-plugin 在 onRequest 里组装一段 **SSE 形态的假响应**（HTTP 200 + `text/event-stream`），写入 `shortCircuitResponse` 并返回。
 
-```509:521:resources/openclaw/config/extensions/qclaw-plugin/packages/content-plugin/src/interceptor.ts
-              // 设置短路响应，FetchChain 将跳过 originalFetch
-              ctx.shortCircuitResponse = new Response(encoder.encode(sseBody), {
-                status: 200, statusText: "OK",
-                headers: {
-                  "Content-Type": "text/event-stream",
-                  "Cache-Control": "no-cache",
-                  "Connection": "keep-alive",
-                },
-              });
-              return ctx;
-```
-
-FetchChain 检测到 `shortCircuitResponse` 后跳过 `originalFetch`，但仍进入 onResponse 逆序——content-plugin 可在输出侧继续处理，error-response-handler 在 HTTP 错误场景仍可在最外层兜底（本例 status 200，通常不触发）。
+FetchChain 看到短路标记后跳过真实 fetch，但仍走 onResponse 逆序——输出侧仍可继续处理；本例 status 为 200，通常不会触发 error-response-handler 的 HTTP 错误包装。
 
 ### 5.3 案例 B：queue-guard 跨层桥接
 
@@ -429,61 +297,27 @@ sequenceDiagram
 
 ## 七、扩展指南：如何新增 FetchMiddleware
 
-在 Package 的 `setup(ctx)` 中：
+在 Package 的 `setup(ctx)` 中调用 `ctx.registerFetchMiddleware({ id, priority, match?, onRequest?, onResponse?, onError? })`：
 
-```typescript
-ctx.registerFetchMiddleware({
-  id: 'my-feature',              // 全局唯一；重复注册覆盖旧实例
-  priority: 500,                   // 对照 01 §5.3 优先级规范
-  match: (input, init) => {
-    const method = (init?.method || 'GET').toUpperCase()
-    return method === 'POST' && /* 窄化到 LLM 请求 */
-  },
-  onRequest: async (ctx) => {
-    // 改 ctx.input / ctx.init；或 ctx.extra 存数据
-    // 需要拦截且不发网络：ctx.shortCircuitResponse = new Response(...)
-    return ctx
-  },
-  onResponse: async ({ response, extra }) => response,
-  onError: async ({ error, extra }) => undefined,  // 可选：返回 Response 恢复
-})
-```
+| 字段 | 要点 |
+|------|------|
+| `id` | 全局唯一；重复注册覆盖旧实例 |
+| `priority` | 对照 [02 附录](./02-qclaw-plugin-data-journey.md#appendix-dev) |
+| `match` | 建议窄化到 LLM POST；排除自身审核/配置 URL |
+| `onRequest` | 可改 body/header；拦截用 `shortCircuitResponse`，勿轻易 throw |
+| `onResponse` | 逆序执行；可包装 SSE 流 |
+| `onError` | 可选：originalFetch 失败时返回恢复用 Response |
 
-**上线前检查清单：**
-
-- 内部 HTTP 是否用了 `ctx.getOriginalFetch()`？（拉配置、上报、调第三方 API）
-- `match` 是否排除了自身服务 URL？（参考 content-plugin、pcmgr-ai-security 单测里的「跳过审核接口自身请求」）
-- onRequest/onResponse 异常是否 fail-open（return 原 ctx/response）？
-- 拦截用户可见回复时，优先 `shortCircuitResponse` 而非 throw？
-- priority 是否与 content-plugin(200)、queue-guard(300) 等冲突或顺序颠倒？
-
-将 Package 加入 `index.ts` 的 `PACKAGES` 数组即可参与注册；无需直接碰 `globalThis.fetch`。
+将 Package 加入 **PACKAGES** 列表即可；检查清单见 [§三 实践要点](#三执行模型一次-fetch-如何穿过链条)；字段契约见 [附录 A（可选）](#附录-a可选fetchmiddleware-接口速查)。
 
 ---
 
-## 八、测试与调试
+## 八、如何验证与调试（无需读单测文件）
 
-### 8.1 单元测试（`__tests__/fetch-chain.test.ts`）
-
-| 场景 | 断言要点 |
-|------|---------|
-| install / uninstall | 替换与恢复 `globalThis.fetch` |
-| 重复 install | 同一实例忽略；第二实例合并中间件 |
-| 洋葱顺序 | onRequest 100→200；onResponse 200→100 |
-| match | `match: () => false` 的中间件不执行 |
-| 无中间件 / 无匹配 | 直调 originalFetch |
-| 延迟注册 | install 后 register 仍生效 |
-| onRequest 异常 | 后续中间件仍执行 |
-| onError | originalFetch 抛错时中间件可返回 recovered Response |
-
-Package 单测通常 mock `ctx.registerFetchMiddleware` 收集中间件，直接调用 `onRequest`/`onResponse` 测业务逻辑，无需启动 OpenClaw。
-
-### 8.2 本地调试
-
-1. 启动后搜 **`[qclaw-plugin] register() END`**，确认 `middlewares=[...]` 列表与预期 priority 一致。
-2. 搜 **`[qclaw-plugin:fetch-chain] [diag]`**：`SHORT_CIRCUIT`、`onRequest ERROR`、`onResponse ERROR`、`originalFetch ERROR`。
-3. 开发环境开启 **prompt-inspector**（环境变量 + ConfigCenter + 窗口状态三层门控），订阅 `onMiddlewareExecuted` 查看 Response 修改链。
-4. Hook 阻断与 Fetch 短路是不同机制：前者看 HookProxy 的 `dispatch(...) BLOCKED` 日志。
+1. 启动 QClaw 后，在控制台搜 **`[qclaw-plugin] register() END`**，确认 `middlewares=[id(priority), ...]` 与 [02 附录 B](./02-qclaw-plugin-data-journey.md#b-fetch-middleware-priority升序--onrequest-顺序) 一致。
+2. 搜 **`[qclaw-plugin:fetch-chain] [diag]`**：`SHORT_CIRCUIT` 表示未发真实 LLM；`onRequest ERROR` 等表示单步 fail-open 继续。
+3. 开发环境可开 **prompt-inspector**（三层门控），观察各中间件对 Response 的修改链。
+4. **Hook `block`** 与 **Fetch `shortCircuit`** 是两套机制：前者看 HookProxy 的 `dispatch(...) BLOCKED` 日志。
 
 ---
 
@@ -497,52 +331,40 @@ Package 单测通常 mock `ctx.registerFetchMiddleware` 收集中间件，直接
 
 **与系列衔接：**
 
-- 读完本文后，建议回读 [02 §等模型回复时](./02-qclaw-plugin-data-journey.md#等模型回复时请求经过哪些关卡)，把表中每一行对应到本文 `execute()` 的某一环。
-- 模块全景与 priority 规范见 [01](./01-qclaw-plugin-architecture-research.md)。
+- 读完本文后，建议回读 [02 §等模型回复时](./02-qclaw-plugin-data-journey.md#等模型回复时请求经过哪些关卡)，把表中每一行对应到本文 execute 三步的某一环。
+- 模块全景见 [01](./01-qclaw-plugin-architecture-research.md)；priority 表见 [02 附录](./02-qclaw-plugin-data-journey.md#appendix-dev)。
 
 ---
 
-## 附录 A：FetchMiddleware 接口速查
+## 附录 A（可选）：FetchMiddleware 接口速查
 
-```typescript
-export interface FetchRequestContext {
-  input: RequestInfo | URL
-  init: RequestInit | undefined
-  extra: Record<string, unknown>
-  shortCircuitResponse?: Response   // 设置后跳过 originalFetch
-}
+> 准备**扩展或审计** Fetch 中间件时使用；只读系列正文的读者可跳过。注册步骤见 [§七](#七扩展指南如何新增-fetchmiddleware)。
 
-export interface FetchResponseContext {
-  input: RequestInfo | URL
-  init: RequestInit | undefined
-  response: Response
-  extra: Record<string, unknown>
-}
-
-export interface FetchMiddleware {
-  id: string
-  priority: number
-  match?: (input: RequestInfo | URL, init?: RequestInit) => boolean
-  onRequest?: (ctx: FetchRequestContext) => Promise<FetchRequestContext>
-  onResponse?: (ctx: FetchResponseContext) => Promise<Response>
-  onError?: (ctx: FetchErrorContext) => Promise<Response | void>
-}
-```
-
-（摘自 `core/types.ts`。）
+| 类型 / 字段 | 含义 |
+|-------------|------|
+| **FetchRequestContext** | `onRequest` 入参：`input`、`init`、`extra`；可设 **`shortCircuitResponse`** 跳过真实 LLM HTTP |
+| **FetchResponseContext** | `onResponse` 入参：含 `response`、`extra`（与本次 onRequest 共享） |
+| **FetchErrorContext** | `onError` 入参：`error`、`extra`；若返回 `Response` 则结束链条，不再向上抛 |
+| **FetchMiddleware.id** | 全局唯一；同 id 再次注册会**覆盖**旧中间件 |
+| **FetchMiddleware.priority** | onRequest **升序**；onResponse / onError **降序** |
+| **FetchMiddleware.match** | 可选；返回 false 则本中间件不参与本次 fetch |
+| **onRequest / onResponse / onError** | 均为可选异步钩子；单步异常应 fail-open，不拖垮 Agent |
 
 ---
 
-## 附录 B：关键文件索引
+## 附录 B：概念索引（可选·对照实现）
 
-| 文件 | 作用 |
-|------|------|
-| `core/fetch-chain.ts` | FetchChain 实现：install、execute、单例合并 |
-| `core/types.ts` | FetchMiddleware 类型契约 |
-| `core/context.ts` | `registerFetchMiddleware`、`getOriginalFetch` |
-| `index.ts` | 创建 FetchChain、Package setup 后 `install()` |
-| `__tests__/fetch-chain.test.ts` | 链行为单元测试 |
-| `packages/*/index.ts` 或 `*/interceptor.ts` | 各 Package 中间件注册与实现 |
+| 概念 | 在链条中的角色 |
+|------|----------------|
+| FetchChain | 替换 `globalThis.fetch` 的执行器；install / execute / 单例合并 |
+| FetchMiddleware | 可插拔单元：match、onRequest、onResponse、onError |
+| QClawContext.registerFetchMiddleware | Package 注册入口 |
+| getOriginalFetch | 绕过链条的原始 fetch，防递归 |
+| shortCircuitResponse | onRequest 设假响应，跳过真实 LLM HTTP |
+| onError | originalFetch 失败时按 priority 降序尝试恢复；首个返回 Response 的钩子结束链条 |
+| onMiddlewareExecuted | 调试观测：谁改了 Response |
+
+需要对照具体实现时，再在安装目录 qclaw-plugin 下查看 core 与 packages（0.2.5+ 可能已混淆）。
 
 ---
 

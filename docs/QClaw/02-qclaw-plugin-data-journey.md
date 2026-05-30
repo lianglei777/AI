@@ -2,7 +2,7 @@
 
 > 本文跟一条用户消息，看数据在 QClaw 核心插件 **qclaw-plugin** 里如何被处理。  
 > 想查「有哪些模块、目录怎么分」请看 [01-qclaw-plugin-architecture-research.md](./01-qclaw-plugin-architecture-research.md)；想深入 Fetch 中间件链原理请看 [03-qclaw-fetch-chain-deep-dive.md](./03-qclaw-fetch-chain-deep-dive.md)；本篇只讲**动态旅程**。  
-> 源码路径（未压缩版本）：`resources/openclaw/config/extensions/qclaw-plugin/`。
+> 正文不依赖阅读源码；可选对照路径见文末脚注。
 
 ---
 
@@ -31,7 +31,7 @@
 | Agent 开始 | 出现「思考中」 | 建立本轮追踪、准备合规上下文 |
 | 组 Prompt | 仍在思考 | 往系统提示里追加规则；崩溃恢复时打点 |
 | 即将问模型 | 等待变长 | 排队取号；审计上下文就绪 |
-| 访问模型 | 流式字开始出现 | 审核输入 → 排队放行 → 优化 Prompt → 发 HTTP |
+| 访问模型 | 流式字开始出现 | 恢复（若有）→ 审核输入 → 审计 → 排队放行 → 优化 Prompt → 发 HTTP |
 | 模型输出 | 字继续蹦 | 记录用量；审核输出流 |
 | 调工具 | 界面出现工具步骤 | 检查 Skill 授权、AI 安全、内容合规 |
 | 回合结束 | 回复完整 | 收尾上报；**后台**写记忆/摘要（不挡你当前这条回复） |
@@ -57,6 +57,39 @@ flowchart LR
   Agent --> UI
 ```
 
+**双轨对照（与上表互补）**：横轴为 Hook 生命周期（消息进入 → 组 Prompt → llm_input → 工具 → agent_end）；纵轴为单次 LLM 请求的 Fetch 关卡（出门 100→200→250→300→900，回家逆序）。下文 [各阶段谁在干活](#各阶段谁在干活) 与 [出门：请求一层层过](#出门请求一层层过) 分别展开两轨。
+
+```mermaid
+flowchart TB
+  subgraph hookAxis [Hook生命周期_示意]
+    H1[message_received]
+    H1a[before_agent_start]
+    H2[before_prompt_build]
+    H3[llm_input]
+    H3o[llm_output]
+    H4[before_tool_call]
+    H5[agent_end]
+    H1 --> H1a --> H2 --> H3 --> H3o
+    H3o --> H4
+    H4 -.->|可多轮| H3
+    H4 --> H5
+  end
+  subgraph fetchAxis [Fetch_onRequest_单次LLM]
+    F1[100恢复]
+    F2[200审核]
+    F3[250审计]
+    F4[300排队]
+    F5[900优化]
+    F1 --> F2 --> F3 --> F4 --> F5
+  end
+  H3 -.->|触发fetch| F1
+```
+
+**读图注意：**
+
+- **Hook 轴**为示意：未画出同事件多模块的 priority 细节（例如 `message_received` 上 trace **100** 先于 content **500**）；复杂任务会在 `llm_input` ↔ 工具调用之间**重复多轮**（虚线回环）。
+- **Fetch 轴**只表示单次 LLM 请求的 **onRequest（出门）**；**onResponse（回家）** 为逆序（约 950 → … → 50），见下文 [回家：响应一层层过](#回家响应一层层过)。
+
 ---
 
 ## 本文讲什么、不讲什么
@@ -79,16 +112,16 @@ flowchart LR
 
 ## 插件启动时做了什么
 
-OpenClaw 加载插件时会调用 `register(api)`（见 `index.ts`）。与「跟消息」相关的步骤是：
+OpenClaw 加载插件时会调用 **register(api)**（插件入口）。与「跟消息」相关的步骤是：
 
 1. 创建 **HookProxy**（统一向 OpenClaw 注册 Hook）、**FetchChain**（统一替换 `globalThis.fetch`）、配置中心、上报器等。
 2. 按顺序对 **15 个 Package** 调用 `setup(ctx)`；某个 Package 失败只打日志，**不阻断**其余模块。
 3. **qmemory** 额外用 `api.on` 直接注册 `session_start` / `session_end`（这两个事件不经 HookProxy）。
 4. 最后 `fetchChain.install()`，把全局 `fetch` 接到中间件链上。
 
-**为什么值得写一句：** OpenClaw 可能对多 Agent / Gateway **多次**调用 `register()`。FetchChain 做了进程级单例：后续实例只把自己的中间件**合并**进已安装实例，避免 `fetch` 被包多层、同一请求跑 N 遍（见 `core/fetch-chain.ts` 文件头注释）。
+**为什么值得写一句：** OpenClaw 可能对多 Agent / Gateway **多次**调用 `register()`。FetchChain 做了进程级单例：后续实例只把自己的中间件**合并**进已安装实例，避免 `fetch` 被包多层、同一请求跑 N 遍（详见 [03 §4.1](./03-qclaw-fetch-chain-deep-dive.md)）。
 
-当前活跃 Package（`index.ts` 中 `PACKAGES` 数组，共 15 个）：
+当前活跃 Package（**PACKAGES** 列表，共 15 个）：
 
 `trace-span-reporter`、`error-response-handler`、`cron-delivery-guard`、`prompt-optimizer`、`pcmgr-ai-security`、`skill-interceptor`、`queue-guard`、`qmemory`、`content-plugin`、`data-sync-report`、`workspace-summary`、`skill-usage-analyzer`、`auto-memory`、`agent-browser-reporter`、`prompt-inspector`。
 
@@ -99,7 +132,7 @@ OpenClaw 加载插件时会调用 `register(api)`（见 `index.ts`）。与「�
 ### 先讲个故事
 
 1. **你发出消息**  
-   OpenClaw 收到后触发 `message_received`。插件侧 mainly 做追踪与上报，一般不在这里挡住你。
+   OpenClaw 收到后触发 `message_received`（消息已进入）。插件侧主要做追踪与上报，一般不在这里挡住你。
 
 2. **Agent 准备开工**  
    `before_agent_start`：建立本轮调用的根 Span、traceId 映射等（内容安全与链路追踪都会用到）。
@@ -129,7 +162,7 @@ OpenClaw 加载插件时会调用 `register(api)`（见 `index.ts`）。与「�
 
 ### 各阶段谁在干活
 
-下表按 OpenClaw 事件顺序列出主路径上的模块。**同一事件多个模块时，priority 数字越小越先执行**（默认 500）。Hook 事件全集见 `core/types.ts` 中的 `HookEvent`。
+下表按 OpenClaw 事件顺序列出主路径上的模块。**同一事件多个模块时，priority 数字越小越先执行**（默认 500）。
 
 | 阶段（白话） | 时机（Hook） | 主要模块 | priority | 数据 / 行为摘要 |
 |--------------|--------------|----------|:--------:|-----------------|
@@ -175,7 +208,7 @@ FetchChain 的洋葱模型、`shortCircuitResponse`、单例合并等机制见 [
 - **出门（onRequest）**：先过序号小的关卡，再真正 `fetch` 上网。
 - **回家（onResponse）**：顺序反过来，序号大的先处理返回体。
 
-实现见 `core/fetch-chain.ts` 的 `execute()`：onRequest 正序遍历匹配的中间件；若有 `shortCircuitResponse` 则**不访问真实网络**；否则 `originalFetch`；onResponse 逆序遍历。
+Fetch 链执行器按 priority 遍历：onRequest 正序；若有 `shortCircuitResponse` 则**不访问真实网络**；否则访问真实 LLM；onResponse 逆序。机制详见 [03 §三](./03-qclaw-fetch-chain-deep-dive.md)。
 
 ### 出门：请求一层层过
 
@@ -191,7 +224,7 @@ FetchChain 的洋葱模型、`shortCircuitResponse`、单例合并等机制见 [
 **三个容易忽略的设计：**
 
 1. **排队桥接**  
-   `llm_input`（Hook 300）里 `pushPendingContext(sessionKey, …)`，Fetch 里 `shiftPendingContext()` 取出——因为 Fetch 中间件拿不到 Hook 里的 `sessionKey`（`queue-guard/index.ts` 注释）。
+   `llm_input`（Hook 300）里 `pushPendingContext(sessionKey, …)`，Fetch 里 `shiftPendingContext()` 取出——因为 Fetch 中间件拿不到 Hook 里的 `sessionKey`（queue-guard 设计注释）。
 
 2. **两种「拦住」**  
    - Hook 返回 `{ block: true }`：后续 Hook handler 不再执行（如部分 `before_tool_call`）。  
@@ -246,7 +279,7 @@ sequenceDiagram
 
 **感知：** 功能多但不至于「装多个插件后顺序乱了、同一条请求被处理好几遍」。
 
-**实现：** qclaw-plugin 核心层对每个 Hook 事件只注册一次 `api.on`，内部按 priority 调度；Fetch 全局只安装一条链。单 Package `setup` 抛错不影响其他 Package（`index.ts` 初始化循环 `try/catch`）。
+**实现：** qclaw-plugin 核心层对每个 Hook 事件只注册一次 `api.on`，内部按 priority 调度；Fetch 全局只安装一条链。单 Package `setup` 抛错不影响其他 Package（初始化循环 try/catch，见 [01 原则四](./01-qclaw-plugin-architecture-research.md)）。
 
 ### 让回答更快、更省资源
 
@@ -317,18 +350,15 @@ sequenceDiagram
 | **本篇** | 一条消息的时间顺序、Fetch 关卡、优化动机 |
 | [03-qclaw-fetch-chain-deep-dive.md](./03-qclaw-fetch-chain-deep-dive.md) | FetchChain 设计动机、execute 模型、扩展中间件 |
 
-**相对 01 的勘误（以当前源码为准）：**
-
-| 01 中的说法 | 核实结果 |
-|-------------|----------|
-| prompt-inspector Fetch priority 999 | 实际 **950**（`index.ts` 注释 999 已过时） |
-| content-plugin `message_received` priority 300 | 未传 priority，默认 **500** |
-| qmemory 全走 HookProxy | `session_start` / `session_end` **直连** `api.on` |
-| 活跃 Package 15 个 | 与 `PACKAGES` 一致；`tool-sandbox` 未启用 |
+**文档同步说明：** 上述 priority 与模块数量已与 [01 架构探索](./01-qclaw-plugin-architecture-research.md) 文首「阅读提示」对齐（2026-05-30）。若你发现两篇仍不一致，以**本篇附录**为准。
 
 ---
 
-## 附录：给想翻源码的读者
+## 附录（可选）：开发者速查
+
+<a id="appendix-dev"></a>
+
+> **不读附录也能理解上文主路径。** 本节供需要对照实现或本地调试的读者使用。
 
 ### A. Hook priority 速查（主路径）
 
@@ -397,4 +427,4 @@ Hook 阻断时会打 `dispatch(...) BLOCKED`（`hook-proxy.ts`）。
 
 ---
 
-*文档基于 QClaw 安装目录下未混淆的 qclaw-plugin 源码整理；若你本地版本已压缩，请以同版本反混淆或安装包内路径为准。*
+*文档基于未混淆 qclaw-plugin 梳理；0.2.5+ 安装包内插件可能已压缩。可选源码路径：`resources/openclaw/config/extensions/qclaw-plugin/`（以你本机 QClaw 安装目录为准）。*
